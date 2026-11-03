@@ -1,0 +1,6 @@
+name: perturbseq
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+prefix: /Users/qxy119/Documents/miniconda3/envs/perturbseq

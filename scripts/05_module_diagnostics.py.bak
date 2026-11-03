@@ -1,0 +1,170 @@
+import argparse
+import re
+from pathlib import Path
+
+import anndata as ad
+import igraph as ig
+import leidenalg
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.stats import mannwhitneyu
+from sklearn.neighbors import NearestNeighbors
+
+DATA = Path("data/processed/effect_matrix_clean.h5ad")
+SUMMARY = Path("results/tables/perturbation_summary_adjusted.csv")
+FIG_DIR = Path("results/figures")
+TABLE_DIR = Path("results/tables")
+
+FAMILIES = {
+    "Ribosome": r"^RP[LS]\d",
+    "Mito ribosome": r"^MRP[LS]\d",
+    "Proteasome": r"^PSM[ABCD]\d",
+    "Complex I": r"^NDUF",
+    "RNA Pol II": r"^POLR2",
+    "Exosome": r"^EXOSC\d",
+}
+
+
+def family_of(g):
+    if not isinstance(g, str):
+        return "Other"
+    for f, p in FAMILIES.items():
+        if re.match(p, g):
+            return f
+    return "Other"
+
+
+def knn(X, k):
+    nn = NearestNeighbors(n_neighbors=k + 1, metric="cosine").fit(X)
+    d, idx = nn.kneighbors(X)
+    return 1 - d[:, 1:], idx[:, 1:]
+
+
+def build_graph(sim, idx):
+    edges = {}
+    for i in range(idx.shape[0]):
+        for s, j in zip(sim[i], idx[i]):
+            e = (min(i, j), max(i, j))
+            edges[e] = max(edges.get(e, -1), float(s))
+    g = ig.Graph(n=idx.shape[0], edges=list(edges), directed=False)
+    g.es["weight"] = [max(w, 0.0) for w in edges.values()]
+    return g
+
+
+def best_f1(families, clusters):
+    rows = []
+    for f in FAMILIES:
+        member = families == f
+        n = int(member.sum())
+        if n < 5:
+            continue
+        best = (0.0, None, 0.0, 0.0)
+        for c in np.unique(clusters[member]):
+            in_c = clusters == c
+            tp = (member & in_c).sum()
+            prec, rec = tp / in_c.sum(), tp / n
+            f1 = 2 * prec * rec / (prec + rec)
+            if f1 > best[0]:
+                best = (f1, int(c), prec, rec)
+        rows.append(dict(family=f, n=n, best_f1=best[0], cluster=best[1],
+                         precision=best[2], recall=best[3]))
+    return pd.DataFrame(rows)
+
+
+def main(k, min_z, max_p):
+    adata = ad.read_h5ad(DATA)
+    s = pd.read_csv(SUMMARY, index_col=0).loc[adata.obs_names]
+    base = s["qc_pass"].astype(bool) & ~s["is_control"].astype(bool)
+    X_all = adata.obsm["X_pca"]
+
+    # ---------- Part 1: in-module vs scattered family members ----------
+    names = adata.obs_names[base]
+    X = X_all[base.values]
+    meta = s.loc[names].copy()
+    meta["family"] = meta["target_gene"].map(family_of)
+    genes = meta["target_gene"].fillna("").values
+    fam = meta["family"].values
+
+    _, idx = knn(X, k + 20)
+    frac = np.full(len(meta), np.nan)
+    for i in np.where(fam != "Other")[0]:
+        neigh = [j for j in idx[i] if genes[j] != genes[i]][:k]
+        frac[i] = np.mean(fam[neigh] == fam[i])
+    meta["frac_neighbors_same_family"] = frac
+    fm = meta[meta["family"] != "Other"].copy()
+    fm["in_module"] = fm["frac_neighbors_same_family"] >= 0.3
+
+    print(f"Family members: {len(fm)}; in-module (>=30% same-family neighbours): "
+          f"{int(fm['in_module'].sum())}")
+    rows = []
+    for col in ["adjusted_effect_z", "knockdown_efficiency", "num_cells_filtered"]:
+        a = fm.loc[fm["in_module"], col].dropna()
+        b = fm.loc[~fm["in_module"], col].dropna()
+        p = mannwhitneyu(a, b).pvalue if len(a) and len(b) else np.nan
+        rows.append(dict(metric=col, in_module_median=a.median(),
+                         scattered_median=b.median(), mannwhitney_p=p))
+    diag = pd.DataFrame(rows)
+    print("\nIn-module vs scattered members:")
+    print(diag.to_string(index=False))
+    fm.to_csv(TABLE_DIR / "family_member_module_status.csv")
+    diag.to_csv(TABLE_DIR / "in_module_vs_scattered.csv", index=False)
+
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4.5))
+    for a_, col, lab in [(ax[0], "adjusted_effect_z", "Adjusted effect score"),
+                         (ax[1], "knockdown_efficiency", "Knockdown efficiency")]:
+        data = [fm.loc[fm["in_module"], col].dropna(),
+                fm.loc[~fm["in_module"], col].dropna().clip(-1, None)]
+        a_.boxplot(data, labels=[f"in module\n(n={len(data[0])})",
+                                 f"scattered\n(n={len(data[1])})"])
+        a_.set_ylabel(lab)
+    fig.suptitle("Known-complex members: recovered vs. scattered")
+    plt.tight_layout()
+    plt.savefig(FIG_DIR / "05_in_module_vs_scattered.png", dpi=200)
+    plt.close()
+
+    # ---------- Part 2: responsive-only graph + resolution sweep ----------
+    resp = base & (s["adjusted_effect_z"] >= min_z) & (s["energy_test_p_value"] <= max_p)
+    print(f"\nResponsive perturbations (z>={min_z}, energy p<={max_p}): "
+          f"{int(resp.sum())}/{int(base.sum())}")
+    Xr = X_all[resp.values]
+    fam_r = s.loc[resp, "target_gene"].map(family_of).values
+    sim, idx_r = knn(Xr, k)
+    g = build_graph(sim, idx_r)
+
+    sweep = []
+    memberships = {}
+    for res in [0.5, 1, 2, 4, 8]:
+        part = leidenalg.find_partition(
+            g, leidenalg.RBConfigurationVertexPartition,
+            weights="weight", resolution_parameter=res, seed=42)
+        m = np.array(part.membership)
+        memberships[res] = m
+        f1 = best_f1(fam_r, m)
+        sweep.append(dict(resolution=res, n_clusters=len(np.unique(m)),
+                          median_cluster_size=int(np.median(np.bincount(m))),
+                          mean_family_best_f1=f1["best_f1"].mean()))
+        f1.assign(resolution=res).to_csv(
+            TABLE_DIR / f"family_f1_res{res}.csv", index=False)
+    sweep = pd.DataFrame(sweep)
+    print("\nResolution sweep (responsive graph):")
+    print(sweep.round(3).to_string(index=False))
+    sweep.to_csv(TABLE_DIR / "leiden_resolution_sweep.csv", index=False)
+
+    best_res = sweep.loc[sweep["mean_family_best_f1"].idxmax(), "resolution"]
+    print(f"\nBest resolution by mean family F1: {best_res}")
+    print(best_f1(fam_r, memberships[best_res]).round(3).to_string(index=False))
+
+    out = s.loc[resp, ["target_gene", "adjusted_effect_z", "knockdown_efficiency"]].copy()
+    out["family"] = fam_r
+    out["cluster"] = memberships[best_res]
+    out.to_csv(TABLE_DIR / "responsive_network_nodes.csv")
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--k", type=int, default=10)
+    p.add_argument("--min-z", type=float, default=5)
+    p.add_argument("--max-p", type=float, default=0.001)
+    a = p.parse_args()
+    main(a.k, a.min_z, a.max_p)

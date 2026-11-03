@@ -1,0 +1,2 @@
+n_positive_pairs,n_negative_pairs,positive_prevalence,average_precision,ap_over_prevalence,auroc
+7460,422668,0.017343674441096604,0.37798083610292826,21.793584594005406,0.8199774250655056

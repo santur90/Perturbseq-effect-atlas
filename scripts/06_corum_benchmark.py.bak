@@ -1,0 +1,1419 @@
+import argparse
+from collections import defaultdict
+from pathlib import Path
+
+import anndata as ad
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.neighbors import NearestNeighbors
+
+
+DATA = Path("data/processed/effect_matrix_clean.h5ad")
+SUMMARY = Path("results/tables/perturbation_summary_adjusted.csv")
+CORUM = Path("data/reference/corum_human_core.csv")
+
+FIG_DIR = Path("results/figures")
+TABLE_DIR = Path("results/tables")
+
+FIG_DIR.mkdir(parents=True, exist_ok=True)
+TABLE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def parse_corum(
+    corum_file,
+    available_genes,
+    min_complex_size=3,
+    max_complex_size=50,
+    min_screen_members=3,
+):
+    """
+    Parse Human CORUM complexes.
+
+    Keep complexes with:
+      - at least min_complex_size total members
+      - at most max_complex_size total members
+      - at least min_screen_members genes represented
+        in the Perturb-seq analysis set
+    """
+
+    corum = pd.read_csv(corum_file)
+
+    required = [
+        "ComplexID",
+        "ComplexName",
+        "Organism",
+        "subunits.Gene.name.",
+    ]
+
+    missing = [
+        column
+        for column in required
+        if column not in corum.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Missing CORUM columns: {missing}"
+        )
+
+    corum = corum[
+        corum["Organism"].eq("Human")
+    ].copy()
+
+    available_genes = set(
+        str(g).upper()
+        for g in available_genes
+    )
+
+    records = []
+
+    for _, row in corum.iterrows():
+
+        members = {
+            gene.strip().upper()
+            for gene in str(
+                row["subunits.Gene.name."]
+            ).split(";")
+            if gene.strip()
+            and gene.strip().lower() != "nan"
+        }
+
+        if not (
+            min_complex_size
+            <= len(members)
+            <= max_complex_size
+        ):
+            continue
+
+        represented = members & available_genes
+
+        if len(represented) < min_screen_members:
+            continue
+
+        records.append(
+            {
+                "complex_id":
+                    str(row["ComplexID"]),
+                "complex_name":
+                    row["ComplexName"],
+                "all_members":
+                    members,
+                "screen_members":
+                    represented,
+                "n_all_members":
+                    len(members),
+                "n_screen_members":
+                    len(represented),
+            }
+        )
+
+    return records
+
+
+def build_gene_embeddings(
+    adata,
+    summary,
+    min_z,
+    max_p,
+):
+    """
+    Collapse multiple promoter perturbations for the
+    same target gene to one median PCA embedding.
+
+    Only responsive, QC-passing, non-control
+    perturbations are included.
+    """
+
+    summary = summary.loc[
+        adata.obs_names
+    ].copy()
+
+    mask = (
+        summary["qc_pass"].astype(bool)
+        & ~summary["is_control"].astype(bool)
+        & summary["target_gene"].notna()
+        & (
+            summary["adjusted_effect_z"]
+            >= min_z
+        )
+        & (
+            summary["energy_test_p_value"]
+            <= max_p
+        )
+    )
+
+    selected = summary.loc[
+        mask
+    ].copy()
+
+    selected["matrix_position"] = np.where(
+        mask.to_numpy()
+    )[0]
+
+    X_pca = adata.obsm["X_pca"]
+
+    gene_rows = []
+    gene_embeddings = []
+
+    for gene, group in selected.groupby(
+        "target_gene",
+        sort=True,
+    ):
+        positions = group[
+            "matrix_position"
+        ].to_numpy()
+
+        embedding = np.nanmedian(
+            X_pca[positions],
+            axis=0,
+        )
+
+        if not np.isfinite(
+            embedding
+        ).all():
+            continue
+
+        gene_rows.append(
+            {
+                "target_gene":
+                    str(gene).upper(),
+                "n_perturbations":
+                    len(group),
+                "median_adjusted_effect_z":
+                    group[
+                        "adjusted_effect_z"
+                    ].median(),
+                "median_knockdown_efficiency":
+                    group[
+                        "knockdown_efficiency"
+                    ].median(),
+                "median_num_cells":
+                    group[
+                        "num_cells_filtered"
+                    ].median(),
+                "min_energy_test_p_value":
+                    group[
+                        "energy_test_p_value"
+                    ].min(),
+            }
+        )
+
+        gene_embeddings.append(
+            embedding
+        )
+
+    gene_metadata = (
+        pd.DataFrame(gene_rows)
+        .set_index("target_gene")
+    )
+
+    gene_embeddings = np.vstack(
+        gene_embeddings
+    ).astype(np.float32)
+
+    return (
+        gene_metadata,
+        gene_embeddings,
+        selected,
+    )
+
+
+def build_annotations(
+    genes,
+    complexes,
+):
+    """
+    Return:
+      gene_to_complexes
+      complex_to_genes
+      complex_name
+    """
+
+    gene_set = set(genes)
+
+    gene_to_complexes = defaultdict(set)
+    complex_to_genes = {}
+    complex_names = {}
+
+    for record in complexes:
+
+        complex_id = record[
+            "complex_id"
+        ]
+
+        members = (
+            record["screen_members"]
+            & gene_set
+        )
+
+        if len(members) < 3:
+            continue
+
+        complex_to_genes[
+            complex_id
+        ] = members
+
+        complex_names[
+            complex_id
+        ] = record[
+            "complex_name"
+        ]
+
+        for gene in members:
+            gene_to_complexes[
+                gene
+            ].add(
+                complex_id
+            )
+
+    return (
+        gene_to_complexes,
+        complex_to_genes,
+        complex_names,
+    )
+
+
+def find_neighbors(
+    embeddings,
+    k_max,
+):
+    """
+    Find cosine nearest neighbors.
+
+    Self-neighbor is removed.
+    """
+
+    n_neighbors = min(
+        k_max + 1,
+        len(embeddings),
+    )
+
+    model = NearestNeighbors(
+        n_neighbors=n_neighbors,
+        metric="cosine",
+        n_jobs=-1,
+    )
+
+    model.fit(embeddings)
+
+    distances, indices = (
+        model.kneighbors(
+            embeddings
+        )
+    )
+
+    similarities = (
+        1.0
+        - distances[:, 1:]
+    )
+
+    indices = indices[:, 1:]
+
+    return similarities, indices
+
+
+def evaluate_neighbor_recovery(
+    genes,
+    similarities,
+    indices,
+    gene_to_complexes,
+    k_values,
+):
+    """
+    Gene-level nearest-neighbor benchmark.
+
+    A neighbor is considered positive if query and
+    neighbor share at least one retained CORUM complex.
+    """
+
+    rows = []
+    query_rows = []
+
+    max_k = max(k_values)
+
+    for i, query_gene in enumerate(
+        genes
+    ):
+        true_complexes = gene_to_complexes.get(
+            query_gene,
+            set(),
+        )
+
+        if not true_complexes:
+            continue
+
+        neighbor_indices = indices[
+            i,
+            :max_k,
+        ]
+
+        neighbor_genes = genes[
+            neighbor_indices
+        ]
+
+        labels = np.array(
+            [
+                int(
+                    bool(
+                        true_complexes
+                        & gene_to_complexes.get(
+                            neighbor_gene,
+                            set(),
+                        )
+                    )
+                )
+                for neighbor_gene
+                in neighbor_genes
+            ]
+        )
+
+        positive_ranks = np.where(
+            labels == 1
+        )[0]
+
+        first_positive_rank = (
+            int(
+                positive_ranks[0] + 1
+            )
+            if len(
+                positive_ranks
+            ) > 0
+            else np.nan
+        )
+
+        query_result = {
+            "query_gene":
+                query_gene,
+            "n_true_complexes":
+                len(true_complexes),
+            "first_positive_rank":
+                first_positive_rank,
+            "reciprocal_rank":
+                (
+                    1.0
+                    / first_positive_rank
+                    if np.isfinite(
+                        first_positive_rank
+                    )
+                    else 0.0
+                ),
+        }
+
+        for k in k_values:
+
+            top_labels = labels[:k]
+
+            query_result[
+                f"hit_at_{k}"
+            ] = int(
+                top_labels.sum() > 0
+            )
+
+            query_result[
+                f"precision_at_{k}"
+            ] = float(
+                top_labels.mean()
+            )
+
+        query_rows.append(
+            query_result
+        )
+
+    query_table = pd.DataFrame(
+        query_rows
+    )
+
+    for k in k_values:
+
+        rows.append(
+            {
+                "method":
+                    "Perturb-seq cosine",
+                "k":
+                    k,
+                "n_queries":
+                    len(query_table),
+                "hit_rate_at_k":
+                    query_table[
+                        f"hit_at_{k}"
+                    ].mean(),
+                "mean_precision_at_k":
+                    query_table[
+                        f"precision_at_{k}"
+                    ].mean(),
+                "mrr":
+                    query_table[
+                        "reciprocal_rank"
+                    ].mean(),
+            }
+        )
+
+    return (
+        pd.DataFrame(rows),
+        query_table,
+    )
+
+
+def evaluate_complex_prediction(
+    genes,
+    similarities,
+    indices,
+    gene_to_complexes,
+    k_neighbors=20,
+):
+    """
+    Held-out complex-label prediction.
+
+    The query gene's CORUM annotation is hidden.
+    Neighbor CORUM labels vote for predicted complexes.
+
+    The labels are used only after the neighbors have
+    already been identified from Perturb-seq embeddings.
+    """
+
+    rows = []
+
+    for i, query_gene in enumerate(
+        genes
+    ):
+        truth = gene_to_complexes.get(
+            query_gene,
+            set(),
+        )
+
+        if not truth:
+            continue
+
+        votes = defaultdict(float)
+
+        for similarity, neighbor_index in zip(
+            similarities[
+                i,
+                :k_neighbors,
+            ],
+            indices[
+                i,
+                :k_neighbors,
+            ],
+        ):
+            neighbor_gene = genes[
+                neighbor_index
+            ]
+
+            neighbor_complexes = (
+                gene_to_complexes.get(
+                    neighbor_gene,
+                    set(),
+                )
+            )
+
+            if not neighbor_complexes:
+                continue
+
+            # Distribute a neighbor's vote across all
+            # complexes annotated to that neighbor.
+            weight = max(
+                float(similarity),
+                0.0,
+            ) / len(
+                neighbor_complexes
+            )
+
+            for complex_id in (
+                neighbor_complexes
+            ):
+                votes[
+                    complex_id
+                ] += weight
+
+        ranked = sorted(
+            votes.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+
+        ranks = [
+            rank
+            for rank, (
+                complex_id,
+                _
+            ) in enumerate(
+                ranked,
+                start=1,
+            )
+            if complex_id in truth
+        ]
+
+        best_rank = (
+            min(ranks)
+            if ranks
+            else np.nan
+        )
+
+        rows.append(
+            {
+                "query_gene":
+                    query_gene,
+                "n_true_complexes":
+                    len(truth),
+                "n_predicted_complexes":
+                    len(ranked),
+                "best_true_complex_rank":
+                    best_rank,
+                "top1_correct":
+                    int(
+                        np.isfinite(
+                            best_rank
+                        )
+                        and best_rank <= 1
+                    ),
+                "top5_correct":
+                    int(
+                        np.isfinite(
+                            best_rank
+                        )
+                        and best_rank <= 5
+                    ),
+                "top10_correct":
+                    int(
+                        np.isfinite(
+                            best_rank
+                        )
+                        and best_rank <= 10
+                    ),
+                "reciprocal_rank":
+                    (
+                        1.0 / best_rank
+                        if np.isfinite(
+                            best_rank
+                        )
+                        else 0.0
+                    ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def evaluate_pairwise(
+    genes,
+    embeddings,
+    gene_to_complexes,
+    random_state=42,
+    max_negative_pairs=500_000,
+):
+    """
+    Pairwise CORUM benchmark.
+
+    Positives:
+      gene pairs sharing >=1 retained CORUM complex.
+
+    Negatives:
+      gene pairs not sharing a retained complex.
+
+    All positive pairs are retained.
+    Negative pairs are subsampled if necessary.
+    """
+
+    rng = np.random.default_rng(
+        random_state
+    )
+
+    norms = np.linalg.norm(
+        embeddings,
+        axis=1,
+        keepdims=True,
+    )
+
+    normalized = embeddings / np.clip(
+        norms,
+        1e-12,
+        None,
+    )
+
+    labels = []
+    scores = []
+
+    positive_count = 0
+    negative_seen = 0
+
+    negative_reservoir = []
+
+    n = len(genes)
+
+    for i in range(n - 1):
+
+        query_complexes = (
+            gene_to_complexes.get(
+                genes[i],
+                set(),
+            )
+        )
+
+        if not query_complexes:
+            continue
+
+        similarity = (
+            normalized[
+                i + 1:
+            ]
+            @ normalized[i]
+        )
+
+        for offset, score in enumerate(
+            similarity,
+            start=i + 1,
+        ):
+            other_complexes = (
+                gene_to_complexes.get(
+                    genes[offset],
+                    set(),
+                )
+            )
+
+            if not other_complexes:
+                continue
+
+            is_positive = bool(
+                query_complexes
+                & other_complexes
+            )
+
+            if is_positive:
+
+                labels.append(1)
+                scores.append(
+                    float(score)
+                )
+
+                positive_count += 1
+
+            else:
+
+                negative_seen += 1
+
+                item = float(score)
+
+                if len(
+                    negative_reservoir
+                ) < max_negative_pairs:
+
+                    negative_reservoir.append(
+                        item
+                    )
+
+                else:
+
+                    j = rng.integers(
+                        0,
+                        negative_seen,
+                    )
+
+                    if j < (
+                        max_negative_pairs
+                    ):
+                        negative_reservoir[
+                            j
+                        ] = item
+
+    labels.extend(
+        [0]
+        * len(
+            negative_reservoir
+        )
+    )
+
+    scores.extend(
+        negative_reservoir
+    )
+
+    labels = np.asarray(
+        labels,
+        dtype=int,
+    )
+
+    scores = np.asarray(
+        scores,
+        dtype=float,
+    )
+
+    if len(
+        np.unique(labels)
+    ) < 2:
+        raise ValueError(
+            "Pairwise benchmark requires "
+            "both positive and negative pairs."
+        )
+
+    return {
+        "n_positive_pairs":
+            int(
+                (labels == 1).sum()
+            ),
+        "n_negative_pairs":
+            int(
+                (labels == 0).sum()
+            ),
+        "average_precision":
+            average_precision_score(
+                labels,
+                scores,
+            ),
+        "auroc":
+            roc_auc_score(
+                labels,
+                scores,
+            ),
+        "positive_prevalence":
+            float(
+                labels.mean()
+            ),
+    }
+
+
+def random_baseline(
+    embeddings,
+    genes,
+    gene_to_complexes,
+    k_values,
+    n_permutations=100,
+    random_state=42,
+):
+    """
+    Random-label baseline.
+
+    Perturb-seq geometry is retained, while gene labels
+    are permuted across embeddings.
+    """
+
+    rng = np.random.default_rng(
+        random_state
+    )
+
+    max_k = max(k_values)
+
+    similarities, indices = (
+        find_neighbors(
+            embeddings,
+            max_k,
+        )
+    )
+
+    rows = []
+
+    for permutation in range(
+        n_permutations
+    ):
+
+        shuffled_genes = rng.permutation(
+            genes
+        )
+
+        metrics, _ = (
+            evaluate_neighbor_recovery(
+                shuffled_genes,
+                similarities,
+                indices,
+                gene_to_complexes,
+                k_values,
+            )
+        )
+
+        metrics["method"] = (
+            "Permuted gene labels"
+        )
+
+        metrics[
+            "permutation"
+        ] = permutation
+
+        rows.append(
+            metrics
+        )
+
+    return pd.concat(
+        rows,
+        ignore_index=True,
+    )
+
+
+def main(
+    min_z,
+    max_p,
+    min_complex_size,
+    max_complex_size,
+    min_screen_members,
+    n_permutations,
+):
+    print(
+        "Loading Perturb-seq data..."
+    )
+
+    adata = ad.read_h5ad(DATA)
+
+    summary = pd.read_csv(
+        SUMMARY,
+        index_col=0,
+    )
+
+    (
+        gene_metadata,
+        embeddings,
+        perturbation_metadata,
+    ) = build_gene_embeddings(
+        adata,
+        summary,
+        min_z=min_z,
+        max_p=max_p,
+    )
+
+    genes = gene_metadata.index.to_numpy()
+
+    print(
+        "Responsive perturbations:",
+        len(
+            perturbation_metadata
+        ),
+    )
+
+    print(
+        "Responsive target genes:",
+        len(genes),
+    )
+
+    print(
+        "\nLoading CORUM..."
+    )
+
+    complexes = parse_corum(
+        CORUM,
+        available_genes=genes,
+        min_complex_size=min_complex_size,
+        max_complex_size=max_complex_size,
+        min_screen_members=min_screen_members,
+    )
+
+    (
+        gene_to_complexes,
+        complex_to_genes,
+        complex_names,
+    ) = build_annotations(
+        genes,
+        complexes,
+    )
+
+    annotated_genes = np.array(
+        [
+            gene
+            for gene in genes
+            if gene in gene_to_complexes
+        ]
+    )
+
+    print(
+        "Retained CORUM complexes:",
+        len(
+            complex_to_genes
+        ),
+    )
+
+    print(
+        "CORUM-annotated responsive genes:",
+        len(
+            annotated_genes
+        ),
+    )
+
+    # Use all responsive genes as the searchable
+    # neighbor universe.
+    k_values = [
+        1,
+        5,
+        10,
+        20,
+    ]
+
+    max_k = max(k_values)
+
+    similarities, indices = (
+        find_neighbors(
+            embeddings,
+            max_k=max_k,
+        )
+    )
+
+    print(
+        "\nEvaluating nearest-neighbor "
+        "complex recovery..."
+    )
+
+    (
+        neighbor_metrics,
+        query_metrics,
+    ) = evaluate_neighbor_recovery(
+        genes,
+        similarities,
+        indices,
+        gene_to_complexes,
+        k_values,
+    )
+
+    print(
+        neighbor_metrics.round(4)
+        .to_string(
+            index=False
+        )
+    )
+
+    print(
+        "\nEvaluating held-out complex "
+        "label prediction..."
+    )
+
+    complex_prediction = (
+        evaluate_complex_prediction(
+            genes,
+            similarities,
+            indices,
+            gene_to_complexes,
+            k_neighbors=20,
+        )
+    )
+
+    complex_summary = {
+        "n_queries":
+            len(
+                complex_prediction
+            ),
+        "top1_accuracy":
+            complex_prediction[
+                "top1_correct"
+            ].mean(),
+        "top5_accuracy":
+            complex_prediction[
+                "top5_correct"
+            ].mean(),
+        "top10_accuracy":
+            complex_prediction[
+                "top10_correct"
+            ].mean(),
+        "mrr":
+            complex_prediction[
+                "reciprocal_rank"
+            ].mean(),
+    }
+
+    print(
+        pd.Series(
+            complex_summary
+        ).round(4)
+    )
+
+    print(
+        "\nEvaluating pairwise "
+        "same-complex prediction..."
+    )
+
+    pairwise = evaluate_pairwise(
+        genes,
+        embeddings,
+        gene_to_complexes,
+    )
+
+    print(
+        pd.Series(
+            pairwise
+        ).round(5)
+    )
+
+    print(
+        "\nRunning random-label baseline..."
+    )
+
+    random_metrics = random_baseline(
+        embeddings,
+        genes,
+        gene_to_complexes,
+        k_values,
+        n_permutations=n_permutations,
+    )
+
+    random_summary = (
+        random_metrics
+        .groupby("k")
+        .agg(
+            random_hit_mean=(
+                "hit_rate_at_k",
+                "mean",
+            ),
+            random_hit_sd=(
+                "hit_rate_at_k",
+                "std",
+            ),
+            random_precision_mean=(
+                "mean_precision_at_k",
+                "mean",
+            ),
+            random_precision_sd=(
+                "mean_precision_at_k",
+                "std",
+            ),
+            random_mrr_mean=(
+                "mrr",
+                "mean",
+            ),
+            random_mrr_sd=(
+                "mrr",
+                "std",
+            ),
+        )
+        .reset_index()
+    )
+
+    comparison = (
+        neighbor_metrics.merge(
+            random_summary,
+            on="k",
+            how="left",
+        )
+    )
+
+    print(
+        "\nPerturb-seq versus "
+        "random-label baseline:"
+    )
+
+    print(
+        comparison.round(4)
+        .to_string(
+            index=False
+        )
+    )
+
+    # ==================================================
+    # Save outputs
+    # ==================================================
+
+    gene_metadata[
+        "n_corum_complexes"
+    ] = [
+        len(
+            gene_to_complexes.get(
+                gene,
+                set(),
+            )
+        )
+        for gene in genes
+    ]
+
+    gene_metadata.to_csv(
+        TABLE_DIR
+        / "corum_gene_metadata.csv"
+    )
+
+    complex_table = []
+
+    for complex_id, members in (
+        complex_to_genes.items()
+    ):
+
+        complex_table.append(
+            {
+                "complex_id":
+                    complex_id,
+                "complex_name":
+                    complex_names[
+                        complex_id
+                    ],
+                "n_screen_members":
+                    len(members),
+                "screen_members":
+                    ";".join(
+                        sorted(
+                            members
+                        )
+                    ),
+            }
+        )
+
+    pd.DataFrame(
+        complex_table
+    ).sort_values(
+        "n_screen_members",
+        ascending=False,
+    ).to_csv(
+        TABLE_DIR
+        / "corum_complexes_retained.csv",
+        index=False,
+    )
+
+    neighbor_metrics.to_csv(
+        TABLE_DIR
+        / "corum_neighbor_metrics.csv",
+        index=False,
+    )
+
+    query_metrics.to_csv(
+        TABLE_DIR
+        / "corum_query_metrics.csv",
+        index=False,
+    )
+
+    complex_prediction.to_csv(
+        TABLE_DIR
+        / "corum_complex_prediction.csv",
+        index=False,
+    )
+
+    pd.DataFrame(
+        [complex_summary]
+    ).to_csv(
+        TABLE_DIR
+        / "corum_complex_prediction_summary.csv",
+        index=False,
+    )
+
+    pd.DataFrame(
+        [pairwise]
+    ).to_csv(
+        TABLE_DIR
+        / "corum_pairwise_metrics.csv",
+        index=False,
+    )
+
+    random_metrics.to_csv(
+        TABLE_DIR
+        / "corum_random_baseline.csv",
+        index=False,
+    )
+
+    comparison.to_csv(
+        TABLE_DIR
+        / "corum_benchmark_comparison.csv",
+        index=False,
+    )
+
+    # ==================================================
+    # Figures
+    # ==================================================
+
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(16, 5),
+    )
+
+    # Hit rate at k
+    axes[0].plot(
+        comparison["k"],
+        comparison["hit_rate_at_k"],
+        marker="o",
+        linewidth=2,
+        label="Perturb-seq",
+    )
+
+    axes[0].errorbar(
+        comparison["k"],
+        comparison["random_hit_mean"],
+        yerr=comparison[
+            "random_hit_sd"
+        ],
+        marker="o",
+        linestyle="--",
+        capsize=3,
+        label="Permuted labels",
+    )
+
+    axes[0].set_xlabel("k neighbors")
+    axes[0].set_ylabel("Hit rate@k")
+    axes[0].set_title(
+        "Same-complex neighbor recovery"
+    )
+    axes[0].legend(
+        frameon=False
+    )
+
+    # Precision at k
+    axes[1].plot(
+        comparison["k"],
+        comparison[
+            "mean_precision_at_k"
+        ],
+        marker="o",
+        linewidth=2,
+        label="Perturb-seq",
+    )
+
+    axes[1].errorbar(
+        comparison["k"],
+        comparison[
+            "random_precision_mean"
+        ],
+        yerr=comparison[
+            "random_precision_sd"
+        ],
+        marker="o",
+        linestyle="--",
+        capsize=3,
+        label="Permuted labels",
+    )
+
+    axes[1].set_xlabel("k neighbors")
+    axes[1].set_ylabel(
+        "Mean precision@k"
+    )
+    axes[1].set_title(
+        "CORUM neighbor precision"
+    )
+    axes[1].legend(
+        frameon=False
+    )
+
+    # Held-out complex prediction
+    bars = [
+        complex_summary[
+            "top1_accuracy"
+        ],
+        complex_summary[
+            "top5_accuracy"
+        ],
+        complex_summary[
+            "top10_accuracy"
+        ],
+        complex_summary["mrr"],
+    ]
+
+    labels = [
+        "Top-1",
+        "Top-5",
+        "Top-10",
+        "MRR",
+    ]
+
+    axes[2].bar(
+        labels,
+        bars,
+        color=[
+            "#4C78A8",
+            "#59A14F",
+            "#F28E2B",
+            "#E15759",
+        ],
+    )
+
+    axes[2].set_ylim(
+        0,
+        min(
+            1.0,
+            max(bars) * 1.2 + 0.02,
+        ),
+    )
+
+    axes[2].set_ylabel("Score")
+    axes[2].set_title(
+        "Held-out complex prediction"
+    )
+
+    for i, value in enumerate(
+        bars
+    ):
+        axes[2].text(
+            i,
+            value,
+            f"{value:.3f}",
+            ha="center",
+            va="bottom",
+        )
+
+    plt.tight_layout()
+
+    plt.savefig(
+        FIG_DIR
+        / "06_corum_benchmark.png",
+        dpi=220,
+        bbox_inches="tight",
+    )
+
+    plt.close()
+
+    print("\nSaved outputs:")
+
+    outputs = [
+        TABLE_DIR
+        / "corum_gene_metadata.csv",
+        TABLE_DIR
+        / "corum_complexes_retained.csv",
+        TABLE_DIR
+        / "corum_benchmark_comparison.csv",
+        TABLE_DIR
+        / "corum_complex_prediction_summary.csv",
+        TABLE_DIR
+        / "corum_pairwise_metrics.csv",
+        FIG_DIR
+        / "06_corum_benchmark.png",
+    ]
+
+    for output in outputs:
+        print(" ", output)
+
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--min-z",
+        type=float,
+        default=5.0,
+    )
+
+    parser.add_argument(
+        "--max-p",
+        type=float,
+        default=0.001,
+    )
+
+    parser.add_argument(
+        "--min-complex-size",
+        type=int,
+        default=3,
+    )
+
+    parser.add_argument(
+        "--max-complex-size",
+        type=int,
+        default=50,
+    )
+
+    parser.add_argument(
+        "--min-screen-members",
+        type=int,
+        default=3,
+    )
+
+    parser.add_argument(
+        "--n-permutations",
+        type=int,
+        default=100,
+    )
+
+    args = parser.parse_args()
+
+    main(
+        min_z=args.min_z,
+        max_p=args.max_p,
+        min_complex_size=(
+            args.min_complex_size
+        ),
+        max_complex_size=(
+            args.max_complex_size
+        ),
+        min_screen_members=(
+            args.min_screen_members
+        ),
+        n_permutations=(
+            args.n_permutations
+        ),
+    )

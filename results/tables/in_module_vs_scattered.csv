@@ -1,0 +1,4 @@
+metric,in_module_median,scattered_median,mannwhitney_p,n_in_module,n_scattered
+adjusted_effect_z,20.740839712803492,5.106646637355,3.399867521693278e-14,188,80
+knockdown_efficiency,0.7866220170532076,0.7612014136223332,0.1680047723973349,188,80
+num_cells_filtered,139.5,140.5,0.8578463733526738,188,80
