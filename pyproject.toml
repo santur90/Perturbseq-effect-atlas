@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "perturbseq-effect-atlas"
+version = "0.1.0"
+description = "Perturbation-effect modeling and CORUM benchmarking on genome-scale Perturb-seq"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "anndata",
+    "scanpy",
+    "matplotlib",
+    "seaborn",
+    "pyarrow",
+    "pyyaml",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+network = ["python-igraph", "leidenalg"]
+deep = ["torch"]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["data", "results"]
+
+[tool.ruff.lint]
+# Catch syntax errors and undefined names only; the analysis scripts are not
+# restyled. This would have caught the broken line in script 08.
+select = ["E9", "F63", "F7", "F82"]
