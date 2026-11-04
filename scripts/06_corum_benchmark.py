@@ -690,7 +690,7 @@ def evaluate_complex_prediction(
                 neighbor_complexes
             )
 
-            for complex_id in (
+            for complex_id in sorted(
                 neighbor_complexes
             ):
                 votes[
@@ -699,8 +699,7 @@ def evaluate_complex_prediction(
 
         ranked = sorted(
             votes.items(),
-            key=lambda item: item[1],
-            reverse=True,
+            key=lambda item: (-item[1], item[0]),
         )
 
         true_ranks = [

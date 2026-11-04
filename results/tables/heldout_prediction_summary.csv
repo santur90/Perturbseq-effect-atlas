@@ -1,0 +1,9 @@
+split,method,n_genes,pearson_mean,pearson_median,delta_pearson_mean,top100_overlap_mean
+A: gene holdout,Complex-neighbor mean,928,0.42256433,0.4278348,0.352058302733778,0.3489655172413793
+A: gene holdout,Ridge (CORUM features),928,0.4326057,0.436078,0.3468958557463464,0.3360668103448276
+A: gene holdout,Ridge (shuffled features),928,0.29876786,0.3014853,0.004253746671996976,0.17114224137931033
+A: gene holdout,Train mean,928,0.29873216,0.30004,,0.17146551724137932
+B: complex-disjoint holdout,Complex-neighbor mean,928,0.278077,0.27749777,,0.16158405172413792
+B: complex-disjoint holdout,Ridge (CORUM features),928,0.29137155,0.29278243,0.11594895073455425,0.1642887931034483
+B: complex-disjoint holdout,Ridge (shuffled features),928,0.2780505,0.2774948,-0.01004502145610002,0.16119612068965516
+B: complex-disjoint holdout,Train mean,928,0.278077,0.27749777,,0.16158405172413792
