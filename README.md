@@ -186,6 +186,8 @@ CORUM annotations are not used to construct the embeddings or neighbor graph.
 
 ![Held-out prediction](results/figures/08_heldout_prediction.png)
 
+In the bottom-right panel, the ridge correlation (about 0.12) arises because all test genes receive the same constant offset vector; it is not gene-specific.
+
 Using only curated CORUM complex membership as features (no phenotype of the held-out gene), I predicted the transcriptome-wide response (8,175 genes) of withheld genes in 5-fold cross-validation over 928 annotated genes. Models were a training-mean baseline, a Jaccard-weighted complex-neighbor average, ridge regression (regularization chosen by cross-validation within the training set), and ridge with row-shuffled features as a negative control.
 
 **Gene holdout.** Both models outperformed the training-mean baseline:

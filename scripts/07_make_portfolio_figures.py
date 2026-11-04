@@ -257,14 +257,14 @@ def main():
         )
 
     ax.text(
-        0.98,
-        0.48,
+        0.50,
+        0.62,
         (
             f"AP enrichment\n"
             f"{pairwise['ap_over_prevalence']:.1f}×"
         ),
         transform=ax.transAxes,
-        ha="right",
+        ha="center",
         va="center",
         fontsize=11,
         fontweight="bold",
