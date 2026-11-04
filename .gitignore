@@ -37,3 +37,6 @@ venv/
 *.backup
 *.bak
 *.backup.md
+
+# MSigDB gene sets: download from the MSigDB site, do not commit
+data/reference/*.gmt
