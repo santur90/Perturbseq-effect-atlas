@@ -34,3 +34,6 @@ venv/
 
 # VS Code
 .vscode/
+*.backup
+*.bak
+*.backup.md
