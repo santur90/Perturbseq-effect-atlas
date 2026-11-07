@@ -51,3 +51,8 @@ def effect():
 def autoenc():
     pytest.importorskip("torch")
     return load_script("09_autoencoder_benchmark.py")
+
+
+@pytest.fixture(scope="session")
+def cases_mod():
+    return load_script("11_case_studies.py")

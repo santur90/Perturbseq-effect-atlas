@@ -23,7 +23,7 @@ The workflow combines perturbation-aware quality control, technical-confounder c
 - **Pairwise same-complex prediction.** AUROC **0.820**, average precision **0.378** at 1.73% positive prevalence (**21.8×** over prevalence).
 - **Held-out response prediction.** Using only CORUM membership as features, predicted responses of withheld genes had Pearson correlation **0.433** (ridge) versus **0.299** for a training-mean baseline (paired difference +0.134, 95% CI 0.124 to 0.144). No gene-specific generalization was found when all complexes of a test gene were withheld.
 - **Representation comparison.** A 50-dimensional denoising autoencoder was comparable to slightly better than 50-dimensional PCA on the CORUM benchmark (pairwise AP +0.020, 95% CI 0.010 to 0.030); several other metrics were not distinguishable from PCA.
-- 40 unit tests and a CI workflow cover the benchmark, split, bootstrap and adjustment logic.
+- 62 unit tests and a CI workflow cover the benchmark, split, bootstrap and adjustment logic.
 
 The held-out complex benchmark ranks CORUM annotations by similarity-weighted votes from phenotype neighbors. The query's CORUM annotation is used to score the ranking, not to generate it. This is a held-out complex-prioritization benchmark, not a claim of de novo or unknown gene-function discovery.
 
@@ -225,6 +225,37 @@ These intervals treat genes as independent although genes in the same complex ar
 
 ---
 
+## Case studies: genes reported in Replogle et al. 2022
+
+![Case studies](results/figures/11_case_studies.png)
+
+As a consistency check, I asked whether five genes reported in the original study have nearest neighbors in the perturbation-effect embedding that are enriched for the matching reference set: CCDC86, ZNF236 and SPATA5L1 (ribosome biogenesis), C7orf26 (transcription) and TMEM242 (mitochondrial respiration). The pairings were fixed before testing. Reference sets were the GO ribosome-biogenesis set (MSigDB `GOBP_RIBOSOME_BIOGENESIS`, ribosomal-protein genes removed; none of the three case genes is a member), the Integrator complex (INTS genes) and the respiratory chain (NDUF, UQCR, COX, SDH and ATP5 genes). The case gene was excluded from its own reference set.
+
+Because strongly responding genes share part of their response, I added a sensitivity analysis after seeing the first results. In it, random comparison sets were drawn to match the reference set's distribution of effect strength (10 quantile bins).
+
+| Gene | Reference set (members in embedding) | Top-20 neighbors in set | Expected, matched null | P (matched) |
+|---|---|---:|---:|---:|
+| CCDC86 | GO ribosome biogenesis (181) | 13 | 2.7 | <= 0.0001 |
+| ZNF236 | GO ribosome biogenesis (181) | 11 | 3.0 | <= 0.0001 |
+| SPATA5L1 | GO ribosome biogenesis (181) | 9 | 1.6 | <= 0.0001 |
+| C7orf26 | Integrator (14) | 3 | 0.16 | 0.0006 |
+| TMEM242 | Respiratory chain (55) | 7 | 0.45 | <= 0.0001 |
+
+P-values come from 10,000 permutations and cannot be smaller than 0.0001; they vary slightly between runs. The pre-specified tests without effect-strength matching were also significant (P <= 0.003, Bonferroni threshold 0.01 for 5 tests).
+
+- **Specificity.** No other gene and reference-set pair was enriched among the top-20 neighbors (matched overlap P >= 0.48), apart from the full-set version of the ribosome-biogenesis test, which is the same test as the primary one without removing ribosomal proteins.
+- **C7orf26 is the weakest case.** Its result rests on three Integrator subunits (INTS10, INTS13 and INTS14), and its mean-similarity test did not meet the corrected threshold under the matched null (P = 0.020 versus 0.01).
+- **TMEM242.** The respiratory-chain neighbors among its 15 nearest genes were all ATP synthase genes, together with several mitochondrial ribosomal-protein genes. The signal is therefore not evidence for the whole respiratory chain.
+- **Mean similarity is not specific.** Even with matching, CCDC86, ZNF236 and SPATA5L1 were more similar to cytosolic ribosomal proteins than matched random sets were (z 11 to 14), yet 0, 2 and 1 of those proteins were among their 20 nearest neighbors. Specificity is therefore judged from nearest-neighbor overlap, not from mean similarity.
+
+These assignments come from the same dataset the original paper analyzed, the matched null was added after inspecting results, and some reference sets are defined by gene-name prefix. This is a consistency check, not an independent replication, and it does not establish gene function.
+
+### Reference gene set (not included in this repository)
+
+The ribosome-biogenesis case study uses the MSigDB human gene set `GOBP_RIBOSOME_BIOGENESIS` (GO:0042254), release v2026.2.Hs. Download it from the [MSigDB gene set page](https://www.gsea-msigdb.org/gsea/msigdb/geneset_page.jsp?geneSetName=GOBP_RIBOSOME_BIOGENESIS) (free registration) and save it as `data/reference/GOBP_RIBOSOME_BIOGENESIS.v2026.2.Hs.gmt`. The file is git-ignored. Cite Subramanian et al. 2005 and Liberzon et al. 2011/2015 as described on the MSigDB site.
+
+---
+
 ## Repository structure
 
 ```text
@@ -246,7 +277,8 @@ perturbseq-effect-atlas/
 │   ├── 07_make_portfolio_figures.py
 │   ├── 08_heldout_perturbation_prediction.py
 │   ├── 09_autoencoder_benchmark.py
-│   └── 10_paired_bootstrap.py
+│   ├── 10_paired_bootstrap.py
+│   └── 11_case_studies.py
 ├── tests/
 ├── .github/workflows/ci.yml
 ├── pyproject.toml
@@ -289,6 +321,8 @@ python scripts/06_corum_benchmark.py --n-permutations 100
 python scripts/08_heldout_perturbation_prediction.py
 python scripts/09_autoencoder_benchmark.py
 python scripts/10_paired_bootstrap.py
+python scripts/11_case_studies.py --gmt data/reference/GOBP_RIBOSOME_BIOGENESIS.v2026.2.Hs.gmt \
+    --gmt-term GOBP_RIBOSOME_BIOGENESIS
 python scripts/07_make_portfolio_figures.py
 ```
 
@@ -343,6 +377,7 @@ autoencoder_minus_pca_bootstrap.csv
 - The adjusted effect score is descriptive, not an inferential statistical z-score, and the responsiveness thresholds are analysis choices.
 - The response-prediction model uses only complex membership. It imputes within known complexes and does not generalize to unseen modules.
 - Bootstrap intervals resample genes independently, ignoring correlation within complexes, and are probably too narrow. PCA was evaluated once while the autoencoder was averaged over 5 seeds.
+- The case-study check uses the same dataset as the original paper, partly name-prefix reference sets, and a matched null added after the first results, so it is not an independent replication.
 - The analysis uses processed perturbation-level profiles rather than single-cell reads, and a single K562 CRISPRi dataset. Other cell types (for example the RPE1 data from the same study), doses, time points and drug perturbations are not covered.
 
 ---
